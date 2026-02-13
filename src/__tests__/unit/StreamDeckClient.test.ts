@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
 import { StreamDeckClient } from "../../StreamDeckClient.js";
+import type { ElicitationCallback } from "../../types.js";
 import { MockServer } from "../helpers/MockServer.js";
 import { MockSocket } from "../helpers/MockSocket.js";
 import { createMockResource, createMockServerInfo, createMockTool, wait } from "../helpers/testUtils.js";
+import { REQUEST_TIMEOUT_MS, RECONNECT_POLL_INTERVAL_MS } from "../../constants.js";
 
 describe("StreamDeckClient", () => {
 	let client: StreamDeckClient;
@@ -91,12 +93,18 @@ describe("StreamDeckClient", () => {
 
 		it("should parse complete JSON message", async () => {
 			const serverInfo = { name: "Test Server", version: "1.0.0" };
-			const response = { id: "1", result: serverInfo };
 
 			// Send request
 			const requestPromise = client.getServerInfo();
 
-			// Simulate response
+			// Capture the request ID from the sent message
+			const writtenData = mockSocket.getWrittenData();
+			const sentData = writtenData[writtenData.length - 1]!;
+			const sentRequest = JSON.parse(sentData.replace("\n", ""));
+			const requestId = sentRequest.id;
+
+			// Simulate response with matching ID
+			const response = { id: requestId, result: serverInfo };
 			mockSocket.simulateData(JSON.stringify(response) + "\n");
 
 			// Should resolve successfully
@@ -105,11 +113,18 @@ describe("StreamDeckClient", () => {
 		});
 
 		it("should handle partial messages", async () => {
-			const response = { id: "1", result: { tools: [] } };
-			const message = JSON.stringify(response) + "\n";
-
 			// Send request
 			const requestPromise = client.getTools();
+
+			// Capture the request ID from the sent message
+			const writtenData = mockSocket.getWrittenData();
+			const sentData = writtenData[writtenData.length - 1]!;
+			const sentRequest = JSON.parse(sentData.replace("\n", ""));
+			const requestId = sentRequest.id;
+
+			// Build response with matching ID
+			const response = { id: requestId, result: { tools: [] } };
+			const message = JSON.stringify(response) + "\n";
 
 			// Send message in parts
 			mockSocket.simulateData(message.slice(0, 10));
@@ -121,11 +136,25 @@ describe("StreamDeckClient", () => {
 		});
 
 		it("should handle multiple messages in one chunk", async () => {
-			const response1 = { id: "1", result: { tools: [] } };
-			const response2 = { id: "2", result: { tools: [] } };
-
 			const request1Promise = client.getTools();
+
+			// Capture the first request ID
+			const writtenData1 = mockSocket.getWrittenData();
+			const sentData1 = writtenData1[writtenData1.length - 1]!;
+			const sentRequest1 = JSON.parse(sentData1.replace("\n", ""));
+			const requestId1 = sentRequest1.id;
+
 			const request2Promise = client.getTools();
+
+			// Capture the second request ID
+			const writtenData2 = mockSocket.getWrittenData();
+			const sentData2 = writtenData2[writtenData2.length - 1]!;
+			const sentRequest2 = JSON.parse(sentData2.replace("\n", ""));
+			const requestId2 = sentRequest2.id;
+
+			// Build responses with matching IDs
+			const response1 = { id: requestId1, result: { tools: [] } };
+			const response2 = { id: requestId2, result: { tools: [] } };
 
 			// Send both responses at once
 			mockSocket.simulateData(JSON.stringify(response1) + "\n" + JSON.stringify(response2) + "\n");
@@ -199,7 +228,7 @@ describe("StreamDeckClient", () => {
 			const requestPromise = client.getTools();
 
 			// Fast-forward time past the timeout
-			jest.advanceTimersByTime(31000); // REQUEST_TIMEOUT_MS + 1000
+			jest.advanceTimersByTime(REQUEST_TIMEOUT_MS + 1000); // REQUEST_TIMEOUT_MS + 1000
 
 			await expect(requestPromise).rejects.toThrow("Request timeout");
 
@@ -616,7 +645,7 @@ describe("StreamDeckClient", () => {
 			mockSocket = new MockSocket();
 
 			// Advance time by polling interval - should trigger reconnection attempt
-			jest.advanceTimersByTime(3000);
+			jest.advanceTimersByTime(RECONNECT_POLL_INTERVAL_MS);
 
 			// Verify polling started by checking that socket factory was called again
 			expect(socketFactoryCallCount).toBeGreaterThan(callCountAfterConnect);
@@ -664,7 +693,7 @@ describe("StreamDeckClient", () => {
 			mockSocket = new MockSocket();
 
 			// Advance time by polling interval
-			jest.advanceTimersByTime(3000);
+			jest.advanceTimersByTime(RECONNECT_POLL_INTERVAL_MS);
 
 			// Verify polling did NOT start - socket factory should not have been called again
 			expect(socketFactoryCallCount).toBe(callCountAfterConnect);
@@ -726,7 +755,7 @@ describe("StreamDeckClient", () => {
 			mockSocket = new MockSocket();
 
 			// Advance time to trigger polling
-			jest.advanceTimersByTime(3000);
+			jest.advanceTimersByTime(RECONNECT_POLL_INTERVAL_MS);
 
 			// Clean up
 			testClient.disconnect();
@@ -758,7 +787,7 @@ describe("StreamDeckClient", () => {
 			errorMockServer.emit("error", error);
 
 			// Should fall back to polling
-			jest.advanceTimersByTime(3000);
+			jest.advanceTimersByTime(RECONNECT_POLL_INTERVAL_MS);
 
 			testClient.disconnect();
 			jest.useRealTimers();
@@ -1024,6 +1053,458 @@ describe("StreamDeckClient", () => {
 
 				// None of these should trigger the notification callback
 				expect(notificationCallback).not.toHaveBeenCalled();
+			});
+		});
+	});
+
+	describe("elicitation handling", () => {
+		beforeEach(async () => {
+			const connectPromise = client.connect(100);
+			mockSocket.simulateConnect();
+			await connectPromise;
+		});
+
+		describe("type guards", () => {
+			it("should identify elicitation request (has both id and method: elicitation/create)", async () => {
+				const elicitationCallback = jest.fn<ElicitationCallback>().mockResolvedValue({ action: "accept", content: { name: "test" } });
+				client.onElicitation(elicitationCallback);
+
+				// Send an elicitation request (has both id and method)
+				const elicitationRequest = {
+					id: "elicit-123",
+					method: "elicitation/create",
+					params: {
+						message: "Please provide your name",
+						mode: "form",
+						requestedSchema: {
+							type: "object",
+							properties: { name: { type: "string" } },
+						},
+						relatedToolCallId: "tool-call-1",
+					},
+				};
+				mockSocket.simulateData(JSON.stringify(elicitationRequest) + "\n");
+
+				await wait(10);
+
+				expect(elicitationCallback).toHaveBeenCalledWith({
+					message: "Please provide your name",
+					mode: "form",
+					requestedSchema: {
+						type: "object",
+						properties: { name: { type: "string" } },
+					},
+					relatedToolCallId: "tool-call-1",
+				});
+			});
+
+			it("should not treat regular IPC response as elicitation request", async () => {
+				const elicitationCallback = jest.fn<ElicitationCallback>();
+				client.onElicitation(elicitationCallback);
+
+				// Send a regular IPC response (has id but no method)
+				const requestPromise = client.getTools();
+
+				const written = mockSocket.getWrittenData();
+				const req = JSON.parse(written[0] ?? "{}");
+
+				mockSocket.simulateData(JSON.stringify({ id: req.id, result: { tools: [] } }) + "\n");
+
+				await requestPromise;
+
+				expect(elicitationCallback).not.toHaveBeenCalled();
+			});
+
+			it("should not treat notification as elicitation request", async () => {
+				const elicitationCallback = jest.fn<ElicitationCallback>();
+				client.onElicitation(elicitationCallback);
+
+				// Send a notification (has method but no id)
+				const notification = { method: "tools/changed", params: { foo: "bar" } };
+				mockSocket.simulateData(JSON.stringify(notification) + "\n");
+
+				await wait(10);
+
+				expect(elicitationCallback).not.toHaveBeenCalled();
+			});
+
+			it("should not treat message with different method as elicitation", async () => {
+				const elicitationCallback = jest.fn<ElicitationCallback>();
+				client.onElicitation(elicitationCallback);
+
+				// Send a message with id and method, but not elicitation/create
+				const otherRequest = {
+					id: "other-123",
+					method: "some/other/method",
+					params: { data: "test" },
+				};
+				mockSocket.simulateData(JSON.stringify(otherRequest) + "\n");
+
+				await wait(10);
+
+				expect(elicitationCallback).not.toHaveBeenCalled();
+			});
+		});
+
+		describe("callback registration", () => {
+			it("should register elicitation callback", () => {
+				const callback = jest.fn<ElicitationCallback>().mockResolvedValue({ action: "accept" });
+				client.onElicitation(callback);
+
+				// No error should be thrown
+				expect(callback).not.toHaveBeenCalled();
+			});
+
+			it("should replace previous elicitation callback", async () => {
+				const callback1 = jest.fn<ElicitationCallback>().mockResolvedValue({ action: "decline" });
+				const callback2 = jest.fn<ElicitationCallback>().mockResolvedValue({ action: "accept" });
+
+				client.onElicitation(callback1);
+				client.onElicitation(callback2);
+
+				const elicitationRequest = {
+					id: "elicit-456",
+					method: "elicitation/create",
+					params: {
+						message: "Test",
+						mode: "form",
+						requestedSchema: { type: "object", properties: {} },
+						relatedToolCallId: "tool-call-456",
+					},
+				};
+				mockSocket.simulateData(JSON.stringify(elicitationRequest) + "\n");
+
+				await wait(10);
+
+				// Only the second callback should be called
+				expect(callback1).not.toHaveBeenCalled();
+				expect(callback2).toHaveBeenCalled();
+			});
+		});
+
+		describe("response handling", () => {
+			it("should send elicitation response back to Stream Deck", async () => {
+				const callback = jest.fn<ElicitationCallback>().mockResolvedValue({ action: "accept", content: { name: "John" } });
+				client.onElicitation(callback);
+
+				const elicitationRequest = {
+					id: "elicit-789",
+					method: "elicitation/create",
+					params: {
+						message: "Enter name",
+						mode: "form",
+						requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+						relatedToolCallId: "tool-call-789",
+					},
+				};
+				mockSocket.simulateData(JSON.stringify(elicitationRequest) + "\n");
+
+				await wait(10);
+
+				// Check that response was written to socket
+				const written = mockSocket.getWrittenData();
+				const response = written.find((w) => {
+					const parsed = JSON.parse(w);
+					return parsed.id === "elicit-789";
+				});
+
+				expect(response).toBeDefined();
+				const parsedResponse = JSON.parse(response!);
+				expect(parsedResponse.id).toBe("elicit-789");
+				expect(parsedResponse.result).toEqual({ action: "accept", content: { name: "John" } });
+			});
+
+			it("should send decline response when no callback registered", async () => {
+				// Don't register any callback
+
+				const elicitationRequest = {
+					id: "elicit-no-cb",
+					method: "elicitation/create",
+					params: {
+						message: "Enter name",
+						mode: "form",
+						requestedSchema: { type: "object", properties: {} },
+						relatedToolCallId: "tool-call-no-cb",
+					},
+				};
+				mockSocket.simulateData(JSON.stringify(elicitationRequest) + "\n");
+
+				await wait(10);
+
+				const written = mockSocket.getWrittenData();
+				const response = written.find((w) => {
+					const parsed = JSON.parse(w);
+					return parsed.id === "elicit-no-cb";
+				});
+
+				expect(response).toBeDefined();
+				const parsedResponse = JSON.parse(response!);
+				expect(parsedResponse.result).toEqual({ action: "decline" });
+			});
+
+			it("should send decline response when callback throws error", async () => {
+				const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+				const callback = jest.fn<ElicitationCallback>().mockRejectedValue(new Error("Callback failed"));
+				client.onElicitation(callback);
+
+				const elicitationRequest = {
+					id: "elicit-error",
+					method: "elicitation/create",
+					params: {
+						message: "Enter name",
+						mode: "form",
+						requestedSchema: { type: "object", properties: {} },
+						relatedToolCallId: "tool-call-error",
+					},
+				};
+				mockSocket.simulateData(JSON.stringify(elicitationRequest) + "\n");
+
+				await wait(10);
+
+				const written = mockSocket.getWrittenData();
+				const response = written.find((w) => {
+					const parsed = JSON.parse(w);
+					return parsed.id === "elicit-error";
+				});
+
+				expect(response).toBeDefined();
+				const parsedResponse = JSON.parse(response!);
+				expect(parsedResponse.result).toEqual({ action: "decline" });
+				expect(consoleErrorSpy).toHaveBeenCalled();
+
+				consoleErrorSpy.mockRestore();
+			});
+		});
+
+		describe("timeout handling", () => {
+			it("should send decline response when callback times out", async () => {
+				jest.useFakeTimers();
+				const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+				// Create a callback that never resolves, forcing the Promise.race timeout to trigger.
+				// The actual ELICITATION_TIMEOUT_MS is 5 minutes (300,000 ms).
+				// We use fake timers to advance past this timeout without waiting.
+				const callback = jest.fn<ElicitationCallback>().mockImplementation(
+					() => new Promise(() => {}) // Never resolves
+				);
+				client.onElicitation(callback);
+
+				const elicitationRequest = {
+					id: "elicit-timeout",
+					method: "elicitation/create",
+					params: {
+						message: "Enter name",
+						mode: "form",
+						requestedSchema: { type: "object", properties: {} },
+						relatedToolCallId: "tool-call-timeout",
+					},
+				};
+				mockSocket.simulateData(JSON.stringify(elicitationRequest) + "\n");
+
+				// Allow the elicitation handler to start processing
+				await Promise.resolve();
+
+				// Advance timers past ELICITATION_TIMEOUT_MS (5 minutes) to trigger the timeout
+				await jest.advanceTimersByTimeAsync(5 * 60_000 + 100);
+
+				const written = mockSocket.getWrittenData();
+				const response = written.find((w) => {
+					const parsed = JSON.parse(w);
+					return parsed.id === "elicit-timeout";
+				});
+
+				expect(response).toBeDefined();
+				const parsedResponse = JSON.parse(response!);
+				expect(parsedResponse.result).toEqual({ action: "decline" });
+				expect(consoleErrorSpy).toHaveBeenCalledWith(
+					expect.stringContaining("Elicitation callback error:"),
+					"Elicitation timeout"
+				);
+
+				consoleErrorSpy.mockRestore();
+				jest.useRealTimers();
+			});
+
+			it("should extend timeout for pending tool call when elicitation is received", async () => {
+				const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+				// Register elicitation callback that resolves quickly
+				const elicitationCallback = jest.fn<ElicitationCallback>().mockResolvedValue({
+					action: "accept",
+					content: { confirmed: true },
+				});
+				client.onElicitation(elicitationCallback);
+
+				// Start a tool call with a specific request ID
+				const toolCallPromise = client.callTool("test_tool", { arg: "value" }, "tool-call-extend-test");
+
+				// Verify the tool call request was sent
+				const written = mockSocket.getWrittenData();
+				expect(written.length).toBe(1);
+				const toolCallReq = JSON.parse(written[0] ?? "{}");
+				expect(toolCallReq.id).toBe("tool-call-extend-test");
+
+				// Send an elicitation request with relatedToolCallId matching the pending tool call
+				const elicitationRequest = {
+					id: "elicit-extend",
+					method: "elicitation/create",
+					params: {
+						message: "Confirm action",
+						mode: "form",
+						requestedSchema: { type: "object", properties: { confirmed: { type: "boolean" } } },
+						relatedToolCallId: "tool-call-extend-test",
+					},
+				};
+				mockSocket.simulateData(JSON.stringify(elicitationRequest) + "\n");
+
+				await wait(10);
+
+				// Verify the timeout extension was logged
+				expect(consoleErrorSpy).toHaveBeenCalledWith(
+					expect.stringContaining("Extended timeout for related tool call: tool-call-extend-test")
+				);
+
+				// Now send the tool call response
+				mockSocket.simulateData(
+					JSON.stringify({ id: "tool-call-extend-test", result: { data: "success" } }) + "\n"
+				);
+
+				const result = await toolCallPromise;
+				expect(result.result).toEqual({ data: "success" });
+
+				consoleErrorSpy.mockRestore();
+			});
+
+			it("should not log extension when relatedToolCallId does not match any pending request", async () => {
+				const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+				// Register elicitation callback
+				const elicitationCallback = jest.fn<ElicitationCallback>().mockResolvedValue({ action: "accept" });
+				client.onElicitation(elicitationCallback);
+
+				// Send an elicitation request with a relatedToolCallId that doesn't match any pending request
+				const elicitationRequest = {
+					id: "elicit-no-match",
+					method: "elicitation/create",
+					params: {
+						message: "Test",
+						mode: "form",
+						requestedSchema: { type: "object", properties: {} },
+						relatedToolCallId: "non-existent-tool-call",
+					},
+				};
+				mockSocket.simulateData(JSON.stringify(elicitationRequest) + "\n");
+
+				await wait(10);
+
+				// Verify the extension log was NOT called (since there's no matching pending request)
+				expect(consoleErrorSpy).not.toHaveBeenCalledWith(
+					expect.stringContaining("Extended timeout for related tool call:")
+				);
+
+				consoleErrorSpy.mockRestore();
+			});
+		});
+
+		describe("message stream parsing", () => {
+			it("should handle elicitation requests mixed with other messages", async () => {
+				const notificationCallback = jest.fn();
+				const elicitationCallback = jest.fn<ElicitationCallback>().mockResolvedValue({ action: "cancel" });
+
+				client.onNotification(notificationCallback);
+				client.onElicitation(elicitationCallback);
+
+				// Start a request
+				const requestPromise = client.getTools();
+				const written = mockSocket.getWrittenData();
+				const req = JSON.parse(written[0] ?? "{}");
+
+				// Send notification, elicitation, and response in one chunk
+				const notification = { method: "event/test" };
+				const elicitation = {
+					id: "elicit-mixed",
+					method: "elicitation/create",
+					params: {
+						message: "Test",
+						mode: "form",
+						requestedSchema: { type: "object", properties: {} },
+						relatedToolCallId: "tool-call-mixed",
+					},
+				};
+				const response = { id: req.id, result: { tools: [] } };
+
+				mockSocket.simulateData(
+					JSON.stringify(notification) + "\n" +
+					JSON.stringify(elicitation) + "\n" +
+					JSON.stringify(response) + "\n"
+				);
+
+				const result = await requestPromise;
+
+				await wait(10);
+
+				expect(result).toEqual([]);
+				expect(notificationCallback).toHaveBeenCalledWith("event/test", undefined);
+				expect(elicitationCallback).toHaveBeenCalled();
+			});
+		});
+
+		describe("error handling", () => {
+			it("should log error when receiving invalid JSON message", async () => {
+				const consoleSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+				// Client is already connected via beforeEach
+				// Send invalid JSON
+				mockSocket.simulateData("not valid json\n");
+
+				await wait(10);
+
+				expect(consoleSpy).toHaveBeenCalledWith(
+					expect.stringContaining("[MCP Bridge]"),
+					expect.any(SyntaxError)
+				);
+
+				consoleSpy.mockRestore();
+			});
+
+			it("should log error when sending elicitation response with destroyed socket", async () => {
+				const consoleSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+				// Client is already connected via beforeEach
+				// Register callback that returns after delay
+				const elicitationCallback = jest.fn<ElicitationCallback>().mockImplementation(async () => {
+					// Wait a bit, then return
+					await wait(50);
+					return { action: "accept", content: { name: "test" } };
+				});
+				client.onElicitation(elicitationCallback);
+
+				// Send elicitation request
+				const elicitation = {
+					id: "elicit-destroy",
+					method: "elicitation/create",
+					params: {
+						message: "Enter name",
+						mode: "form",
+						requestedSchema: { type: "object", properties: {} },
+						relatedToolCallId: "tool-call-destroy",
+					},
+				};
+				mockSocket.simulateData(JSON.stringify(elicitation) + "\n");
+
+				// Before callback completes, destroy the socket
+				await wait(10);
+				mockSocket.destroy();
+
+				// Wait for callback to complete
+				await wait(100);
+
+				expect(consoleSpy).toHaveBeenCalledWith(
+					expect.stringContaining("[MCP Bridge] Cannot send elicitation response: not connected")
+				);
+
+				consoleSpy.mockRestore();
 			});
 		});
 	});

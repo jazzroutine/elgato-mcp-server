@@ -17,7 +17,7 @@ import {
 
 import { DEFAULT_SERVER_INFO, SDK_NOTIFICATIONS } from "./constants.js";
 import { StreamDeckClient } from "./StreamDeckClient.js";
-import type { ServerInfo } from "./types.js";
+import type { ElicitationParams, ElicitationResponse, ServerInfo } from "./types.js";
 import { convertToMcpResources, convertToMcpTools, log } from "./utils.js";
 
 /**
@@ -27,6 +27,8 @@ import { convertToMcpResources, convertToMcpTools, log } from "./utils.js";
  * dynamically discovering and exposing Stream Deck tools through the MCP protocol.
  */
 export class McpBridge {
+	/** Map of correlation IDs to active MCP servers for routing elicitation requests. */
+	private activeToolCalls: Map<string, McpServer> = new Map();
 	private cachedResources: Resource[] = [];
 	private cachedTools: Tool[] = [];
 	private client: StreamDeckClient;
@@ -247,7 +249,7 @@ export class McpBridge {
 			return { tools: this.cachedTools };
 		});
 
-		server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
+		server.setRequestHandler(CallToolRequestSchema, async (request, extra): Promise<CallToolResult> => {
 			const { name, arguments: args = {} } = request.params;
 
 			if (!this.client.isConnected) {
@@ -257,8 +259,17 @@ export class McpBridge {
 				};
 			}
 
+			// Create correlation ID using session ID and request ID
+			// For HTTP mode, sessionId is present; for stdio mode, it's undefined
+			const correlationId = extra.sessionId
+				? `${extra.sessionId}:${extra.requestId}`
+				: String(extra.requestId);
+
+			// Store the McpServer reference for use by the elicitation callback
+			this.activeToolCalls.set(correlationId, mcpServer);
+
 			try {
-				const response = await this.client.callTool(name, args);
+				const response = await this.client.callTool(name, args, correlationId);
 
 				if (response.error) {
 					return {
@@ -284,6 +295,9 @@ export class McpBridge {
 					content: [{ type: "text", text: message }],
 					isError: true,
 				};
+			} finally {
+				// Clear the McpServer reference when the tool call completes
+				this.activeToolCalls.delete(correlationId);
 			}
 		});
 
@@ -375,6 +389,41 @@ export class McpBridge {
 
 		this.client.onNotification((method, params) => {
 			void this.handleStreamDeckNotification(method, params);
+		});
+
+		// Handle elicitation requests from Stream Deck
+		this.client.onElicitation(async (params: ElicitationParams): Promise<ElicitationResponse> => {
+			const { relatedToolCallId } = params;
+
+			// Look up the correct MCP server using the correlation ID
+			const targetMcpServer = this.activeToolCalls.get(relatedToolCallId);
+			if (!targetMcpServer) {
+				log(`No active MCP server found for tool call ${relatedToolCallId}, declining`);
+				return { action: "decline" };
+			}
+
+			try {
+				log(`Forwarding elicitation to MCP client: ${params}`);
+
+				// Cast the schema - Stream Deck provides a JSON Schema object that matches MCP's expected format
+				const result = await targetMcpServer.server.elicitInput({
+					mode: params.mode,
+					message: params.message,
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					requestedSchema: params.requestedSchema as any,
+				});
+
+				log(`Elicitation result from MCP client: ${result}`);
+
+				return {
+					action: result.action,
+					content: result.content,
+				};
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "Unknown error";
+				log("Failed to forward elicitation to MCP client:", message);
+				return { action: "decline" };
+			}
 		});
 	}
 }

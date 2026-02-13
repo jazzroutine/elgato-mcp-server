@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 
 import {
+	ELICITATION_TIMEOUT_MS,
 	LOG_PREFIX,
 	MAX_BUFFER_SIZE,
 	QUICK_CONNECT_TIMEOUT_MS,
@@ -13,6 +15,9 @@ import {
 import type {
 	CallToolRequest,
 	CallToolResponse,
+	ElicitationCallback,
+	ElicitationRequest,
+	ElicitationResponse,
 	IpcResponse,
 	McpResource,
 	McpTool,
@@ -46,12 +51,12 @@ export type ServerFactory = (connectionListener?: (socket: net.Socket) => void) 
  */
 export class StreamDeckClient {
 	private buffer = "";
+	private elicitationCallback: ElicitationCallback | null = null;
 	private notificationCallbacks: NotificationCallback[] = [];
 	private onConnectedCallback: (() => void) | null = null;
 	private onDisconnectedCallback: (() => void) | null = null;
 	private pendingRequests = new Map<string, PendingRequest>();
 	private pollInterval: NodeJS.Timeout | null = null;
-	private requestId = 0;
 	private readonly serverFactory: ServerFactory;
 	private signalServer: net.Server | null = null;
 	private socket: net.Socket | null = null;
@@ -64,7 +69,7 @@ export class StreamDeckClient {
 	 */
 	constructor(
 		socketFactory: SocketFactory = (path: string) => net.createConnection(path),
-		serverFactory: ServerFactory = (listener) => net.createServer(listener)
+		serverFactory: ServerFactory = (listener) => net.createServer(listener),
 	) {
 		this.socketFactory = socketFactory;
 		this.serverFactory = serverFactory;
@@ -81,16 +86,21 @@ export class StreamDeckClient {
 	 * Invokes a tool on Stream Deck.
 	 * @param toolName - Name of the tool to invoke.
 	 * @param args - Arguments to pass to the tool.
+	 * @param requestId - Optional request ID to use for correlation. If provided, must be unique.
 	 * @returns The tool call response.
 	 */
-	public async callTool(toolName: string, args: Record<string, unknown>): Promise<CallToolResponse> {
+	public async callTool(
+		toolName: string,
+		args: Record<string, unknown>,
+		requestId?: string,
+	): Promise<CallToolResponse> {
 		const request: Omit<CallToolRequest, "id"> = {
 			method: "call_tool",
 			toolName,
 			arguments: args,
 		};
 
-		return this.sendRequest<CallToolResponse>(request);
+		return this.sendRequest<CallToolResponse>(request, requestId);
 	}
 
 	/**
@@ -198,6 +208,16 @@ export class StreamDeckClient {
 	}
 
 	/**
+	 * Registers a callback to handle elicitation requests from Stream Deck.
+	 * Only one callback can be registered at a time.
+	 * The callback receives elicitation params and must return a response.
+	 * @param callback - Async callback function that handles elicitation requests.
+	 */
+	public onElicitation(callback: ElicitationCallback): void {
+		this.elicitationCallback = callback;
+	}
+
+	/**
 	 * Registers a callback to be invoked when a notification is received from Stream Deck.
 	 * Multiple callbacks can be registered.
 	 * @param callback - Callback function that receives the method name and optional params.
@@ -236,6 +256,36 @@ export class StreamDeckClient {
 		this.tryStartSignalServer();
 	}
 
+	/**
+	 * Creates a timeout that rejects a pending request after the specified duration.
+	 * @param requestId - The ID of the request to timeout.
+	 * @param reject - The reject function from the request's promise.
+	 * @param timeoutMs - Timeout duration in milliseconds.
+	 * @returns The timeout handle.
+	 */
+	private createRequestTimeout(requestId: string, reject: (error: Error) => void, timeoutMs: number): NodeJS.Timeout {
+		return setTimeout(() => {
+			this.pendingRequests.delete(requestId);
+			reject(new Error("Request timeout"));
+		}, timeoutMs);
+	}
+
+	/**
+	 * Extends the timeout for a pending request by resetting its timer.
+	 * Used when an elicitation request is received to allow time for user input.
+	 * @param requestId - The ID of the pending request to extend.
+	 * @param timeoutMs - New timeout duration in milliseconds (defaults to ELICITATION_TIMEOUT_MS).
+	 * @returns True if the request was found and extended, false otherwise.
+	 */
+	private extendRequestTimeout(requestId: string, timeoutMs: number = ELICITATION_TIMEOUT_MS): boolean {
+		const pending = this.pendingRequests.get(requestId);
+		if (!pending) return false;
+
+		clearTimeout(pending.timeout);
+		pending.timeout = this.createRequestTimeout(requestId, pending.reject, timeoutMs);
+		return true;
+	}
+
 	private handleClose(): void {
 		this.socket = null;
 		this.buffer = "";
@@ -262,7 +312,7 @@ export class StreamDeckClient {
 		this.buffer += typeof data === "string" ? data : data.toString();
 
 		if (this.buffer.length > MAX_BUFFER_SIZE) {
-			console.error(`${LOG_PREFIX} Buffer overflow, clearing buffer`);
+			console.error(`${LOG_PREFIX}: Buffer overflow, clearing buffer`);
 			this.buffer = "";
 			return;
 		}
@@ -276,6 +326,57 @@ export class StreamDeckClient {
 				this.processMessage(message);
 			}
 		}
+	}
+
+	/**
+	 * Handles an elicitation request from Stream Deck.
+	 * Invokes the registered callback and sends the response back to Stream Deck.
+	 * @param request - The elicitation request from Stream Deck.
+	 */
+	private async handleElicitationRequest(request: ElicitationRequest): Promise<void> {
+		const { id, params } = request;
+
+		let response: ElicitationResponse;
+
+		console.error(`${LOG_PREFIX}: Elicitation request received: `, params);
+
+		// Extend the timeout for the related tool call while waiting for user input
+		if (params.relatedToolCallId) {
+			const extended = this.extendRequestTimeout(params.relatedToolCallId, ELICITATION_TIMEOUT_MS);
+			if (extended) {
+				console.error(`${LOG_PREFIX}: Extended timeout for related tool call: ${params.relatedToolCallId}`);
+			}
+		}
+
+		if (!this.elicitationCallback) {
+			// No callback registered - decline the request
+			console.error(`${LOG_PREFIX}: No elicitation callback registered, declining request`);
+			response = { action: "decline" };
+		} else {
+			// Capture timer ID to ensure cleanup after Promise.race() resolves
+			let timeoutId: NodeJS.Timeout;
+			try {
+				// Create a promise that will timeout after ELICITATION_TIMEOUT_MS
+				const timeoutPromise = new Promise<ElicitationResponse>((_, reject) => {
+					timeoutId = setTimeout(() => {
+						reject(new Error("Elicitation timeout"));
+					}, ELICITATION_TIMEOUT_MS);
+				});
+
+				// Race between the callback and the timeout
+				response = await Promise.race([this.elicitationCallback(params), timeoutPromise]);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "Unknown error";
+				console.error(`${LOG_PREFIX}: Elicitation callback error:`, message);
+				response = { action: "decline" };
+			} finally {
+				// Always clear the timeout to prevent timer accumulation
+				clearTimeout(timeoutId!);
+			}
+		}
+
+		// Send response back to Stream Deck
+		this.sendElicitationResponse(id, response);
 	}
 
 	private handleError(error: Error): void {
@@ -351,13 +452,33 @@ export class StreamDeckClient {
 	}
 
 	/**
+	 * Type guard to check if an object is an elicitation request.
+	 * An elicitation request has both `id` and `method: "elicitation/create"`.
+	 * @param obj - The object to check.
+	 * @returns True if the object is an elicitation request.
+	 */
+	private isElicitationRequest(obj: object): obj is ElicitationRequest {
+		const record = obj as Record<string, unknown>;
+		return (
+			"id" in obj &&
+			typeof record.id === "string" &&
+			"method" in obj &&
+			record.method === "elicitation/create" &&
+			"params" in obj &&
+			record.params !== null &&
+			typeof record.params === "object"
+		);
+	}
+
+	/**
 	 * Type guard to check if an object is an IPC response.
-	 * A response has an `id` field of type string.
+	 * A response has an `id` field of type string but no `method` field.
 	 * @param obj - The object to check.
 	 * @returns True if the object is an IPC response.
 	 */
 	private isIpcResponse(obj: object): obj is IpcResponse {
-		return "id" in obj && typeof (obj as Record<string, unknown>).id === "string";
+		const record = obj as Record<string, unknown>;
+		return "id" in obj && typeof record.id === "string" && !("method" in obj);
 	}
 
 	/**
@@ -407,7 +528,7 @@ export class StreamDeckClient {
 
 	/**
 	 * Parses and processes an incoming IPC message.
-	 * Delegates to handleResponse() or handleNotification() based on message type.
+	 * Delegates to handleElicitationRequest(), handleResponse(), or handleNotification() based on message type.
 	 * @param message - The raw IPC message string to parse and process.
 	 */
 	private processMessage(message: string): void {
@@ -419,7 +540,10 @@ export class StreamDeckClient {
 				return;
 			}
 
-			if (this.isIpcResponse(parsed)) {
+			// Check elicitation first since it has both id and method
+			if (this.isElicitationRequest(parsed)) {
+				void this.handleElicitationRequest(parsed);
+			} else if (this.isIpcResponse(parsed)) {
 				this.handleResponse(parsed);
 			} else if (this.isNotification(parsed)) {
 				this.handleNotification(parsed);
@@ -429,19 +553,49 @@ export class StreamDeckClient {
 		}
 	}
 
-	private async sendRequest<T extends IpcResponse>(request: object): Promise<T> {
+	/**
+	 * Sends an elicitation response back to Stream Deck.
+	 * Uses the original request's id for correlation.
+	 * @param id - The id from the original elicitation request.
+	 * @param response - The elicitation response to send.
+	 */
+	private sendElicitationResponse(id: string, response: ElicitationResponse): void {
+		if (!this.socket || this.socket.destroyed) {
+			console.error(`${LOG_PREFIX} Cannot send elicitation response: not connected`);
+			return;
+		}
+
+		const ipcResponse = {
+			id,
+			method: "elicitation/response",
+			result: response,
+		};
+
+		this.socket.write(JSON.stringify(ipcResponse) + "\n");
+	}
+
+	private async sendRequest<T extends IpcResponse>(request: object, requestId?: string): Promise<T> {
 		if (!this.socket || this.socket.destroyed) {
 			throw new Error("Not connected to Stream Deck");
 		}
 
-		const id = String(++this.requestId);
+		// Use provided requestId or generate a new one
+		let id: string;
+		if (requestId !== undefined) {
+			// Check for collision with existing pending request
+			if (this.pendingRequests.has(requestId)) {
+				console.error(`${LOG_PREFIX} Request ID collision: ${requestId} is already pending, cancelling request`);
+				throw new Error(`Request ID collision: ${requestId} is already pending`);
+			}
+			id = requestId;
+		} else {
+			id = randomUUID();
+		}
+
 		const fullRequest = { ...request, id };
 
 		return new Promise<T>((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				this.pendingRequests.delete(id);
-				reject(new Error("Request timeout"));
-			}, REQUEST_TIMEOUT_MS);
+			const timeout = this.createRequestTimeout(id, reject, REQUEST_TIMEOUT_MS);
 
 			this.pendingRequests.set(id, {
 				resolve: resolve as (response: IpcResponse) => void,
