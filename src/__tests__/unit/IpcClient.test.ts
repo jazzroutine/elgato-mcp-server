@@ -1,23 +1,36 @@
-import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, jest } from "@jest/globals";
 
 import { RECONNECT_POLL_INTERVAL_MS, REQUEST_TIMEOUT_MS } from "../../constants.js";
-import { StreamDeckClient } from "../../StreamDeckClient.js";
-import type { ElicitationCallback } from "../../types.js";
+import { IpcClient } from "../../IpcClient.js";
+import type { ElicitationCallback, IpcClientConfig } from "../../types.js";
+import { setVerbose } from "../../utils.js";
 import { MockServer } from "../helpers/MockServer.js";
 import { MockSocket } from "../helpers/MockSocket.js";
 import { createMockResource, createMockServerInfo, createMockTool, wait } from "../helpers/testUtils.js";
 
-describe("StreamDeckClient", () => {
-	let client: StreamDeckClient;
+const testConfig: IpcClientConfig = {
+	name: "test-app",
+	signalSocketPath: "/tmp/test-app-ready.sock",
+	socketPath: "/tmp/test-app.sock",
+};
+
+describe("IpcClient", () => {
+	let client: IpcClient;
 	let mockSocket: MockSocket;
 	let mockServer: MockServer;
+	let consoleErrorSpy: ReturnType<typeof jest.spyOn>;
+
+	beforeAll(() => {
+		consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+	});
 
 	beforeEach(() => {
 		mockSocket = new MockSocket();
 		mockServer = new MockServer();
 
 		// Create client with mock factories
-		client = new StreamDeckClient(
+		client = new IpcClient(
+			testConfig,
 			() => mockSocket as any, // socketFactory
 			(listener) => {
 				// serverFactory
@@ -29,6 +42,15 @@ describe("StreamDeckClient", () => {
 		);
 
 		jest.clearAllMocks();
+		consoleErrorSpy.mockClear();
+	});
+
+	afterEach(() => {
+		setVerbose(false);
+	});
+
+	afterAll(() => {
+		consoleErrorSpy.mockRestore();
 	});
 
 	afterEach(() => {
@@ -378,9 +400,9 @@ describe("StreamDeckClient", () => {
 		it("should throw error when calling methods while disconnected", async () => {
 			client.disconnect();
 
-			await expect(client.getServerInfo()).rejects.toThrow("Not connected to Stream Deck");
-			await expect(client.getTools()).rejects.toThrow("Not connected to Stream Deck");
-			await expect(client.callTool("test", {})).rejects.toThrow("Not connected to Stream Deck");
+			await expect(client.getServerInfo()).rejects.toThrow("Not connected to test-app");
+			await expect(client.getTools()).rejects.toThrow("Not connected to test-app");
+			await expect(client.callTool("test", {})).rejects.toThrow("Not connected to test-app");
 		});
 
 		it("should send correct request for getResources", async () => {
@@ -479,19 +501,19 @@ describe("StreamDeckClient", () => {
 			// Send response without result
 			mockSocket.simulateData(JSON.stringify({ id: req.id }) + "\n");
 
-			await expect(requestPromise).rejects.toThrow("No result returned from Stream Deck");
+			await expect(requestPromise).rejects.toThrow("No result returned from test-app");
 		});
 
 		it("should throw error when calling getResources while disconnected", async () => {
 			client.disconnect();
 
-			await expect(client.getResources()).rejects.toThrow("Not connected to Stream Deck");
+			await expect(client.getResources()).rejects.toThrow("Not connected to test-app");
 		});
 
 		it("should throw error when calling readResource while disconnected", async () => {
 			client.disconnect();
 
-			await expect(client.readResource("streamdeck://test")).rejects.toThrow("Not connected to Stream Deck");
+			await expect(client.readResource("streamdeck://test")).rejects.toThrow("Not connected to test-app");
 		});
 	});
 
@@ -625,7 +647,7 @@ describe("StreamDeckClient", () => {
 			};
 
 			// Create client with tracking socket factory
-			const testClient = new StreamDeckClient(trackingSocketFactory, (listener) => {
+			const testClient = new IpcClient(testConfig, trackingSocketFactory, (listener) => {
 				if (listener) {
 					mockServer.on("connection", listener);
 				}
@@ -666,7 +688,7 @@ describe("StreamDeckClient", () => {
 			};
 
 			// Create client with tracking socket factory
-			const testClient = new StreamDeckClient(trackingSocketFactory, (listener) => {
+			const testClient = new IpcClient(testConfig, trackingSocketFactory, (listener) => {
 				if (listener) {
 					mockServer.on("connection", listener);
 				}
@@ -733,7 +755,7 @@ describe("StreamDeckClient", () => {
 			};
 
 			// Create client with tracking socket factory
-			const testClient = new StreamDeckClient(originalSocketFactory, (listener) => {
+			const testClient = new IpcClient(testConfig, originalSocketFactory, (listener) => {
 				if (listener) {
 					mockServer.on("connection", listener);
 				}
@@ -767,7 +789,8 @@ describe("StreamDeckClient", () => {
 			// Create a custom mock server that simulates EADDRINUSE
 			const errorMockServer = new MockServer();
 
-			const testClient = new StreamDeckClient(
+			const testClient = new IpcClient(
+				testConfig,
 				() => mockSocket as any,
 				(listener) => {
 					return errorMockServer as any;
@@ -813,7 +836,7 @@ describe("StreamDeckClient", () => {
 			};
 
 			// Create client with tracking server factory
-			const testClient = new StreamDeckClient(() => mockSocket as any, trackingServerFactory);
+			const testClient = new IpcClient(testConfig, () => mockSocket as any, trackingServerFactory);
 
 			// Spy on startPolling to verify it's NOT called
 			const startPollingSpy = jest.spyOn(testClient as any, "startPolling");
@@ -844,10 +867,10 @@ describe("StreamDeckClient", () => {
 
 		it("should start polling when handleSocketInUse fails", async () => {
 			jest.useFakeTimers();
-			const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
 
 			// Create client
-			const testClient = new StreamDeckClient(
+			const testClient = new IpcClient(
+				testConfig,
 				() => mockSocket as any,
 				(listener) => {
 					if (listener) {
@@ -881,7 +904,9 @@ describe("StreamDeckClient", () => {
 
 			// Verify error was logged
 			expect(consoleErrorSpy).toHaveBeenCalledWith(
-				expect.stringContaining("handleSocketInUse failed:"),
+				"[MCP Bridge]",
+				"ERROR:",
+				"handleSocketInUse failed:",
 				expect.any(Error),
 			);
 
@@ -889,7 +914,6 @@ describe("StreamDeckClient", () => {
 			expect(startPollingSpy).toHaveBeenCalled();
 
 			testClient.disconnect();
-			consoleErrorSpy.mockRestore();
 			jest.useRealTimers();
 		});
 	});
@@ -1024,8 +1048,6 @@ describe("StreamDeckClient", () => {
 
 		describe("error isolation", () => {
 			it("should catch and log errors from throwing callbacks", async () => {
-				const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
-
 				const errorCallback = jest.fn(() => {
 					throw new Error("Callback failed");
 				});
@@ -1037,14 +1059,15 @@ describe("StreamDeckClient", () => {
 				await wait(10);
 
 				expect(errorCallback).toHaveBeenCalled();
-				expect(consoleErrorSpy).toHaveBeenCalledWith("[MCP Bridge] Notification callback error:", expect.any(Error));
-
-				consoleErrorSpy.mockRestore();
+				expect(consoleErrorSpy).toHaveBeenCalledWith(
+					"[MCP Bridge]",
+					"ERROR:",
+					"Notification callback error:",
+					expect.any(Error),
+				);
 			});
 
 			it("should continue invoking remaining callbacks after one throws", async () => {
-				const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
-
 				const callback1 = jest.fn(() => {
 					throw new Error("First callback failed");
 				});
@@ -1072,8 +1095,6 @@ describe("StreamDeckClient", () => {
 
 				// Two errors should be logged
 				expect(consoleErrorSpy).toHaveBeenCalledTimes(2);
-
-				consoleErrorSpy.mockRestore();
 			});
 		});
 
@@ -1332,8 +1353,6 @@ describe("StreamDeckClient", () => {
 			});
 
 			it("should send decline response when callback throws error", async () => {
-				const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
-
 				const callback = jest.fn<ElicitationCallback>().mockRejectedValue(new Error("Callback failed"));
 				client.onElicitation(callback);
 
@@ -1361,15 +1380,12 @@ describe("StreamDeckClient", () => {
 				const parsedResponse = JSON.parse(response!);
 				expect(parsedResponse.result).toEqual({ action: "decline" });
 				expect(consoleErrorSpy).toHaveBeenCalled();
-
-				consoleErrorSpy.mockRestore();
 			});
 		});
 
 		describe("timeout handling", () => {
 			it("should send decline response when callback times out", async () => {
 				jest.useFakeTimers();
-				const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
 
 				// Create a callback that never resolves, forcing the Promise.race timeout to trigger.
 				// The actual ELICITATION_TIMEOUT_MS is 5 minutes (300,000 ms).
@@ -1407,16 +1423,17 @@ describe("StreamDeckClient", () => {
 				const parsedResponse = JSON.parse(response!);
 				expect(parsedResponse.result).toEqual({ action: "decline" });
 				expect(consoleErrorSpy).toHaveBeenCalledWith(
-					expect.stringContaining("Elicitation callback error:"),
+					"[MCP Bridge]",
+					"ERROR:",
+					"Elicitation callback error:",
 					"Elicitation timeout",
 				);
 
-				consoleErrorSpy.mockRestore();
 				jest.useRealTimers();
 			});
 
 			it("should extend timeout for pending tool call when elicitation is received", async () => {
-				const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+				setVerbose(true);
 
 				// Register elicitation callback that resolves quickly
 				const elicitationCallback = jest.fn<ElicitationCallback>().mockResolvedValue({
@@ -1451,7 +1468,9 @@ describe("StreamDeckClient", () => {
 
 				// Verify the timeout extension was logged
 				expect(consoleErrorSpy).toHaveBeenCalledWith(
-					expect.stringContaining("Extended timeout for related tool call: tool-call-extend-test"),
+					"[MCP Bridge]",
+					"DEBUG:",
+					"Extended timeout for related tool call: tool-call-extend-test",
 				);
 
 				// Now send the tool call response
@@ -1459,12 +1478,10 @@ describe("StreamDeckClient", () => {
 
 				const result = await toolCallPromise;
 				expect(result.result).toEqual({ data: "success" });
-
-				consoleErrorSpy.mockRestore();
 			});
 
 			it("should not log extension when relatedToolCallId does not match any pending request", async () => {
-				const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+				setVerbose(true);
 
 				// Register elicitation callback
 				const elicitationCallback = jest.fn<ElicitationCallback>().mockResolvedValue({ action: "accept" });
@@ -1487,10 +1504,10 @@ describe("StreamDeckClient", () => {
 
 				// Verify the extension log was NOT called (since there's no matching pending request)
 				expect(consoleErrorSpy).not.toHaveBeenCalledWith(
-					expect.stringContaining("Extended timeout for related tool call:"),
+					"[MCP Bridge]",
+					"DEBUG:",
+					expect.stringContaining("Extended timeout for related tool call"),
 				);
-
-				consoleErrorSpy.mockRestore();
 			});
 		});
 
@@ -1537,22 +1554,21 @@ describe("StreamDeckClient", () => {
 
 		describe("error handling", () => {
 			it("should log error when receiving invalid JSON message", async () => {
-				const consoleSpy = jest.spyOn(console, "error").mockImplementation(() => {});
-
 				// Client is already connected via beforeEach
 				// Send invalid JSON
 				mockSocket.simulateData("not valid json\n");
 
 				await wait(10);
 
-				expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("[MCP Bridge]"), expect.any(SyntaxError));
-
-				consoleSpy.mockRestore();
+				expect(consoleErrorSpy).toHaveBeenCalledWith(
+					"[MCP Bridge]",
+					"ERROR:",
+					"Failed to parse message:",
+					expect.any(SyntaxError),
+				);
 			});
 
 			it("should log error when sending elicitation response with destroyed socket", async () => {
-				const consoleSpy = jest.spyOn(console, "error").mockImplementation(() => {});
-
 				// Client is already connected via beforeEach
 				// Register callback that returns after delay
 				const elicitationCallback = jest.fn<ElicitationCallback>().mockImplementation(async () => {
@@ -1582,11 +1598,11 @@ describe("StreamDeckClient", () => {
 				// Wait for callback to complete
 				await wait(100);
 
-				expect(consoleSpy).toHaveBeenCalledWith(
-					expect.stringContaining("[MCP Bridge] Cannot send elicitation response: not connected"),
+				expect(consoleErrorSpy).toHaveBeenCalledWith(
+					"[MCP Bridge]",
+					"ERROR:",
+					"Cannot send elicitation response: not connected",
 				);
-
-				consoleSpy.mockRestore();
 			});
 		});
 	});

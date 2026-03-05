@@ -1,5 +1,8 @@
 import { jest } from "@jest/globals";
-import type { StreamDeckClient } from "../../StreamDeckClient.js";
+
+import type { ClientManager } from "../../ClientManager.js";
+import type { IpcClient } from "../../IpcClient.js";
+import type { McpBridge } from "../../McpBridge.js";
 import type { CallToolResponse, McpResource, McpTool, ServerInfo, ToolsListResponse } from "../../types.js";
 
 /**
@@ -90,11 +93,7 @@ export function wait(ms: number): Promise<void> {
 /**
  * Waits for a condition to be true.
  */
-export async function waitFor(
-	condition: () => boolean,
-	timeout = 1000,
-	interval = 10,
-): Promise<void> {
+export async function waitFor(condition: () => boolean, timeout = 1000, interval = 10): Promise<void> {
 	const startTime = Date.now();
 	while (!condition()) {
 		if (Date.now() - startTime > timeout) {
@@ -122,7 +121,50 @@ export function createDeferred<T>(): {
 }
 
 /**
- * Creates a mock StreamDeckClient for testing.
+ * Creates a mock ClientManager for testing.
+ * Provides a consistent mock implementation that can be customized via overrides.
+ */
+export function createMockClientManager(
+	overrides: Partial<{
+		isConnected: boolean;
+		connectedClients: string[];
+		initialize: jest.Mock;
+		close: jest.Mock;
+		getTools: jest.Mock;
+		getResources: jest.Mock;
+		getServerInfo: jest.Mock;
+		callTool: jest.Mock;
+		readResource: jest.Mock;
+		onToolsChanged: jest.Mock;
+		onResourcesChanged: jest.Mock;
+		onNotification: jest.Mock;
+		onElicitation: jest.Mock;
+		onClientConnected: jest.Mock;
+		onClientDisconnected: jest.Mock;
+	}> = {},
+): jest.Mocked<ClientManager> {
+	return {
+		isConnected: false,
+		connectedClients: [],
+		initialize: jest.fn(),
+		close: jest.fn(),
+		getTools: jest.fn().mockReturnValue([]),
+		getResources: jest.fn().mockReturnValue([]),
+		getServerInfo: jest.fn().mockReturnValue({ name: "Elgato MCP Server", version: "1.0.0" }),
+		callTool: jest.fn(),
+		readResource: jest.fn(),
+		onToolsChanged: jest.fn(),
+		onResourcesChanged: jest.fn(),
+		onNotification: jest.fn(),
+		onElicitation: jest.fn(),
+		onClientConnected: jest.fn(),
+		onClientDisconnected: jest.fn(),
+		...overrides,
+	} as unknown as jest.Mocked<ClientManager>;
+}
+
+/**
+ * Creates a mock IpcClient for testing.
  * Provides a consistent mock implementation that can be customized via overrides.
  */
 export function createMockClient(
@@ -141,7 +183,7 @@ export function createMockClient(
 		onElicitation: jest.Mock;
 		startSignalListener: jest.Mock;
 	}> = {},
-): jest.Mocked<StreamDeckClient> {
+): jest.Mocked<IpcClient> {
 	return {
 		isConnected: false,
 		connect: jest.fn(),
@@ -157,5 +199,34 @@ export function createMockClient(
 		onElicitation: jest.fn(),
 		startSignalListener: jest.fn(),
 		...overrides,
-	} as unknown as jest.Mocked<StreamDeckClient>;
+	} as unknown as jest.Mocked<IpcClient>;
+}
+
+/**
+ * Creates a mock McpBridge for testing.
+ * Provides a consistent mock implementation that can be customized via overrides.
+ */
+export function createMockBridge(
+	overrides: Partial<{
+		isConnected: boolean;
+		initialize: jest.Mock;
+		close: jest.Mock;
+		createServer: jest.Mock;
+		disposeServer: jest.Mock;
+		onToolsChanged: jest.Mock;
+		onResourcesChanged: jest.Mock;
+		onClientNotification: jest.Mock;
+	}> = {},
+): jest.Mocked<McpBridge> {
+	return {
+		isConnected: false,
+		initialize: jest.fn(),
+		close: jest.fn(),
+		createServer: jest.fn(),
+		disposeServer: jest.fn(),
+		onToolsChanged: jest.fn(),
+		onResourcesChanged: jest.fn(),
+		onClientNotification: jest.fn(),
+		...overrides,
+	} as unknown as jest.Mocked<McpBridge>;
 }

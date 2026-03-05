@@ -1,7 +1,7 @@
 /**
- * Stream Deck MCP Bridge - Type Definitions
+ * Elgato MCP Server - Type Definitions
  *
- * Protocol types for communication between MCP clients and Stream Deck IPC.
+ * Protocol types for communication between MCP clients and Elgato app IPC.
  */
 
 /**
@@ -51,34 +51,6 @@ export interface ResourcesReadRequest extends RequestBase {
 }
 
 /**
- * Resources subscribe request.
- */
-export interface ResourcesSubscribeRequest extends RequestBase {
-	method: "resources_subscribe";
-	uri: string;
-}
-
-/**
- * Resources unsubscribe request.
- */
-export interface ResourcesUnsubscribeRequest extends RequestBase {
-	method: "resources_unsubscribe";
-	uri: string;
-}
-
-/**
- * Union type for all IPC requests.
- */
-export type IpcRequest =
-	| CallToolRequest
-	| ResourcesListRequest
-	| ResourcesReadRequest
-	| ResourcesSubscribeRequest
-	| ResourcesUnsubscribeRequest
-	| ServerInfoRequest
-	| ToolsListRequest;
-
-/**
  * Error structure for MCP responses.
  */
 export interface McpError {
@@ -110,7 +82,7 @@ export interface ToolAnnotations {
 /**
  * The sender or recipient of messages and data in a conversation.
  */
-export type Role = 'assistant' | 'user';
+export type Role = "assistant" | "user";
 
 /**
  * Resource annotations providing hints about resource behavior.
@@ -122,7 +94,7 @@ export interface Annotations {
 }
 
 /**
- * Tool definition from Stream Deck.
+ * Tool definition from a connected Elgato app.
  */
 export interface McpTool {
 	name: string;
@@ -136,7 +108,7 @@ export interface McpTool {
 }
 
 /**
- * Resource definition from Stream Deck.
+ * Resource definition from a connected Elgato app.
  */
 export interface McpResource {
 	uri: string;
@@ -159,7 +131,7 @@ export interface ResponseBase {
 }
 
 /**
- * Server info from Stream Deck.
+ * Server info from a connected Elgato app.
  */
 export interface ServerInfo {
 	name: string;
@@ -219,8 +191,8 @@ export interface ResourcesListResponse extends ResponseBase {
 }
 
 /**
- * Resources read result from Stream Deck.
- * Note: Stream Deck returns a single resource with `content` (object),
+ * Resources read result from a connected Elgato app.
+ * Note: The IPC protocol returns a single resource with `content` (object),
  * which must be converted to MCP's `contents` array format.
  */
 export interface ResourcesReadResult {
@@ -237,20 +209,12 @@ export interface ResourcesReadResponse extends ResponseBase {
 }
 
 /**
- * Resources subscribe/unsubscribe response (empty result on success).
- */
-export interface ResourcesSubscribeResponse extends ResponseBase {
-	result?: Record<string, never>;
-}
-
-/**
  * Union type for all IPC responses.
  */
 export type IpcResponse =
 	| CallToolResponse
 	| ResourcesListResponse
 	| ResourcesReadResponse
-	| ResourcesSubscribeResponse
 	| ResponseBase
 	| ServerInfoResponse
 	| ToolsListResponse;
@@ -265,7 +229,7 @@ export interface PendingRequest {
 }
 
 /**
- * Notification from Stream Deck (one-way message without id).
+ * Notification from a connected Elgato app (one-way message without id).
  */
 export interface Notification {
 	method: string;
@@ -273,12 +237,12 @@ export interface Notification {
 }
 
 /**
- * Callback function type for handling notifications from Stream Deck.
+ * Callback function type for handling notifications from a connected Elgato app.
  */
 export type NotificationCallback = (method: string, params?: unknown) => void;
 
 /**
- * Parameters for an elicitation request from Stream Deck.
+ * Parameters for an elicitation request from a connected Elgato app.
  */
 export interface ElicitationParams {
 	message: string;
@@ -289,9 +253,9 @@ export interface ElicitationParams {
 }
 
 /**
- * Elicitation request from Stream Deck.
+ * Elicitation request from a connected Elgato app.
  * Unlike regular notifications, elicitation requests have both an id and a method.
- * The id is used to correlate the response back to Stream Deck.
+ * The id is used to correlate the response back to the originating app.
  */
 export interface ElicitationRequest {
 	id: string;
@@ -311,7 +275,7 @@ export interface ElicitationResponse {
 }
 
 /**
- * Callback function type for handling elicitation requests from Stream Deck.
+ * Callback function type for handling elicitation requests from a connected Elgato app.
  * @param params - The elicitation parameters including the relatedToolCallId for routing.
  * Returns a promise that resolves to the user's response.
  */
@@ -323,6 +287,16 @@ export type ElicitationCallback = (params: ElicitationParams) => Promise<Elicita
 export type TransportMode = "http" | "stdio";
 
 /**
+ * Definition of a known app in the predefined registry.
+ */
+export interface AppDefinition {
+	/** Display name used for tool/resource prefixing and logging. */
+	name: string;
+	/** Base name used to derive platform-specific socket paths. */
+	socketBaseName: string;
+}
+
+/**
  * CLI options parsed from command line arguments.
  */
 export interface CliOptions {
@@ -330,4 +304,25 @@ export interface CliOptions {
 	port: number;
 	ngrok: boolean;
 	help: boolean;
+	verbose: boolean;
+}
+
+/**
+ * Configuration for the ClientManager.
+ */
+export interface ClientManagerConfig {
+	/** List of known apps to connect to. Defaults to KNOWN_APPS from constants. */
+	apps?: AppDefinition[];
+}
+
+/**
+ * Configuration for a single IPC client connection.
+ */
+export interface IpcClientConfig {
+	/** Display name for the app, used for prefixing and logging. */
+	name: string;
+	/** Signal socket path for reconnection notifications. */
+	signalSocketPath: string;
+	/** Main IPC socket path. */
+	socketPath: string;
 }

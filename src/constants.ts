@@ -1,26 +1,17 @@
-import type { ServerInfo } from "./types.js";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
-const SOCKET_BASE_NAME = "elgato-streamdeck-mcp-bridge";
+import type { AppDefinition, ServerInfo } from "./types.js";
 
-/**
- * Get IPC socket path for Stream Deck communication.
- * @returns The platform-specific socket path.
- */
-export const getSocketPath = (): string =>
-	process.platform === "win32" ? `\\\\.\\pipe\\${SOCKET_BASE_NAME}` : `/tmp/${SOCKET_BASE_NAME}.sock`;
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+const pkg = require("../package.json") as { version: string };
 
-/**
- * Get signal socket path for reconnection notifications.
- * @returns The platform-specific signal socket path.
- */
-export const getSignalSocketPath = (): string =>
-	process.platform === "win32" ? `\\\\.\\pipe\\${SOCKET_BASE_NAME}-ready` : `/tmp/${SOCKET_BASE_NAME}-ready.sock`;
-
-/** IPC socket path for Stream Deck communication. */
-export const SOCKET_PATH = getSocketPath();
-
-/** Signal socket path for reconnection notifications. */
-export const SIGNAL_SOCKET_PATH = getSignalSocketPath();
+/** Elgato logo SVG read from the shared assets folder. */
+const ELGATO_ICON_SVG_LIGHT = readFileSync(join(__dirname, "..", "assets", "elgato.svg"), "utf-8");
+const ELGATO_ICON_SVG_DARK = readFileSync(join(__dirname, "..", "assets", "elgato_white.svg"), "utf-8");
 
 /** Timeout for quick connection attempts (ms). */
 export const QUICK_CONNECT_TIMEOUT_MS = 1000;
@@ -46,10 +37,52 @@ export const DEFAULT_SESSION_TIMEOUT_MS = 60 * 60 * 1000;
 /** Cleanup interval: check for idle sessions every 5 minutes */
 export const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 
-/** Default server info when Stream Deck is not connected. */
+/** Known apps that the bridge can connect to. Add entries here to support new apps. */
+export const KNOWN_APPS: AppDefinition[] = [
+	{
+		name: "streamdeck",
+		socketBaseName: "elgato-mcp-streamdeck",
+	},
+];
+
+/** Separator used when prefixing tool/resource names with the app name. */
+export const TOOL_PREFIX_SEPARATOR = "__";
+
+/**
+ * Derives platform-specific socket paths from an app definition.
+ * @param app - The app definition containing the socket base name.
+ * @returns Object with `socketPath` and `signalSocketPath` for the current platform.
+ */
+export function getAppSocketPaths(app: AppDefinition): { signalSocketPath: string; socketPath: string } {
+	const { socketBaseName } = app;
+	if (process.platform === "win32") {
+		return {
+			signalSocketPath: `\\\\.\\pipe\\${socketBaseName}-ready`,
+			socketPath: `\\\\.\\pipe\\${socketBaseName}`,
+		};
+	}
+	return {
+		signalSocketPath: `/tmp/${socketBaseName}-ready.sock`,
+		socketPath: `/tmp/${socketBaseName}.sock`,
+	};
+}
+
+/** Default server info when no apps are connected. */
 export const DEFAULT_SERVER_INFO: ServerInfo = {
-	name: "Stream Deck MCP Server",
-	version: "1.0.0",
+	name: "Elgato MCP Server",
+	version: pkg.version,
+	icons: [
+		{
+			src: `data:image/svg+xml,${encodeURIComponent(ELGATO_ICON_SVG_LIGHT)}`,
+			mimeType: "image/svg+xml",
+			theme: "light",
+		},
+		{
+			src: `data:image/svg+xml,${encodeURIComponent(ELGATO_ICON_SVG_DARK)}`,
+			mimeType: "image/svg+xml",
+			theme: "dark",
+		},
+	],
 };
 
 /** Log message prefix. */
@@ -64,7 +97,7 @@ export const MCP_ERROR_CODES = {
 	SERVER_ERROR: -32000,
 } as const;
 
-/** SDK notification methods received from Stream Deck. */
+/** SDK notification methods received from connected apps. */
 export const SDK_NOTIFICATIONS = {
 	TOOLS_LIST_CHANGED: "notifications/tools/list_changed",
 	RESOURCES_LIST_CHANGED: "notifications/resources/list_changed",

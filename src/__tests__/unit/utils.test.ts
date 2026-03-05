@@ -1,6 +1,15 @@
-import { describe, expect, it, jest } from "@jest/globals";
+import { afterEach, describe, expect, it, jest } from "@jest/globals";
 import type { Resource, Tool } from "@modelcontextprotocol/sdk/types.js";
-import { convertToMcpResources, convertToMcpTools, log, parseCliArgs, printHelp } from "../../utils.js";
+
+import {
+	convertToMcpResources,
+	convertToMcpTools,
+	log,
+	parseCliArgs,
+	printHelp,
+	setVerbose,
+	unprefixName,
+} from "../../utils.js";
 import { createMockResource, createMockTool } from "../helpers/testUtils.js";
 
 describe("utils", () => {
@@ -205,23 +214,151 @@ describe("utils", () => {
 		});
 	});
 
-	describe("log", () => {
-		it("should log to stderr with prefix", () => {
-			const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+	describe("unprefixName", () => {
+		it("should correctly split valid prefixed name", () => {
+			const result = unprefixName("app__tool");
 
-			log("test message");
-
-			expect(consoleErrorSpy).toHaveBeenCalledWith("[MCP Bridge]", "test message");
-			consoleErrorSpy.mockRestore();
+			expect(result).toEqual({
+				appName: "app",
+				itemName: "tool",
+			});
 		});
 
-		it("should handle multiple arguments", () => {
-			const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+		it("should return null for names without separator", () => {
+			const result = unprefixName("toolname");
 
-			log("message", 123, { key: "value" });
+			expect(result).toBeNull();
+		});
 
-			expect(consoleErrorSpy).toHaveBeenCalledWith("[MCP Bridge]", "message", 123, { key: "value" });
-			consoleErrorSpy.mockRestore();
+		it("should split at the FIRST occurrence only with multiple separators", () => {
+			const result = unprefixName("app__sub__tool");
+
+			expect(result).toEqual({
+				appName: "app",
+				itemName: "sub__tool",
+			});
+		});
+
+		it("should return null for empty string", () => {
+			const result = unprefixName("");
+
+			expect(result).toBeNull();
+		});
+
+		it("should handle separator at start (empty app name)", () => {
+			const result = unprefixName("__tool");
+
+			expect(result).toEqual({
+				appName: "",
+				itemName: "tool",
+			});
+		});
+
+		it("should handle separator at end (empty item name)", () => {
+			const result = unprefixName("app__");
+
+			expect(result).toEqual({
+				appName: "app",
+				itemName: "",
+			});
+		});
+
+		it("should handle only separator (both empty)", () => {
+			const result = unprefixName("__");
+
+			expect(result).toEqual({
+				appName: "",
+				itemName: "",
+			});
+		});
+	});
+
+	describe("log", () => {
+		afterEach(() => {
+			setVerbose(false);
+		});
+
+		describe("log.error", () => {
+			it("should always output to stderr with ERROR prefix", () => {
+				const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+				log.error("something broke");
+				expect(spy).toHaveBeenCalledWith("[MCP Bridge]", "ERROR:", "something broke");
+				spy.mockRestore();
+			});
+
+			it("should output even when verbose is disabled", () => {
+				const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+				setVerbose(false);
+				log.error("critical failure");
+				expect(spy).toHaveBeenCalledWith("[MCP Bridge]", "ERROR:", "critical failure");
+				spy.mockRestore();
+			});
+
+			it("should handle multiple arguments", () => {
+				const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+				log.error("message", 123, { key: "value" });
+				expect(spy).toHaveBeenCalledWith("[MCP Bridge]", "ERROR:", "message", 123, { key: "value" });
+				spy.mockRestore();
+			});
+		});
+
+		describe("log.warn", () => {
+			it("should always output to stderr with WARN prefix", () => {
+				const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+				log.warn("watch out");
+				expect(spy).toHaveBeenCalledWith("[MCP Bridge]", "WARN:", "watch out");
+				spy.mockRestore();
+			});
+
+			it("should output even when verbose is disabled", () => {
+				const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+				setVerbose(false);
+				log.warn("something concerning");
+				expect(spy).toHaveBeenCalledWith("[MCP Bridge]", "WARN:", "something concerning");
+				spy.mockRestore();
+			});
+		});
+
+		describe("log.info", () => {
+			it("should be silent when verbose is disabled", () => {
+				const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+				log.info("status update");
+				expect(spy).not.toHaveBeenCalled();
+				spy.mockRestore();
+			});
+
+			it("should output to stderr with INFO prefix when verbose is enabled", () => {
+				const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+				setVerbose(true);
+				log.info("bridge started");
+				expect(spy).toHaveBeenCalledWith("[MCP Bridge]", "INFO:", "bridge started");
+				spy.mockRestore();
+			});
+
+			it("should handle multiple arguments", () => {
+				const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+				setVerbose(true);
+				log.info("message", 123, { key: "value" });
+				expect(spy).toHaveBeenCalledWith("[MCP Bridge]", "INFO:", "message", 123, { key: "value" });
+				spy.mockRestore();
+			});
+		});
+
+		describe("log.debug", () => {
+			it("should be silent when verbose is disabled", () => {
+				const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+				log.debug("detailed info");
+				expect(spy).not.toHaveBeenCalled();
+				spy.mockRestore();
+			});
+
+			it("should output to stderr with DEBUG prefix when verbose is enabled", () => {
+				const spy = jest.spyOn(console, "error").mockImplementation(() => {});
+				setVerbose(true);
+				log.debug("session created:", "abc-123");
+				expect(spy).toHaveBeenCalledWith("[MCP Bridge]", "DEBUG:", "session created:", "abc-123");
+				spy.mockRestore();
+			});
 		});
 	});
 
@@ -234,6 +371,7 @@ describe("utils", () => {
 				port: 9090,
 				ngrok: false,
 				help: false,
+				verbose: false,
 			});
 		});
 
@@ -285,7 +423,18 @@ describe("utils", () => {
 				port: 8080,
 				ngrok: true,
 				help: false,
+				verbose: false,
 			});
+		});
+
+		it("should parse --verbose", () => {
+			const result = parseCliArgs(["--verbose"]);
+			expect(result.verbose).toBe(true);
+		});
+
+		it("should parse -v", () => {
+			const result = parseCliArgs(["-v"]);
+			expect(result.verbose).toBe(true);
 		});
 
 		it("should handle unknown options gracefully", () => {
@@ -302,15 +451,15 @@ describe("utils", () => {
 
 			expect(consoleLogSpy).toHaveBeenCalledTimes(1);
 			const output = consoleLogSpy.mock.calls[0]?.[0] as string;
-			expect(output).toContain("Usage: mcp-server-streamdeck");
+			expect(output).toContain("Usage: elgato-mcp-server");
 			expect(output).toContain("--transport");
 			expect(output).toContain("--http");
 			expect(output).toContain("--port");
 			expect(output).toContain("--ngrok");
 			expect(output).toContain("--help");
+			expect(output).toContain("--verbose");
 
 			consoleLogSpy.mockRestore();
 		});
 	});
 });
-

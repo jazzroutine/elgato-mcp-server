@@ -29,15 +29,21 @@ export interface SessionData {
  * Removes idle sessions that exceed the timeout threshold.
  * @param sessions - Map of active sessions to check
  * @param sessionTimeoutMs - Maximum idle time in milliseconds before cleanup
+ * @param bridge - The MCP bridge instance for disposing server resources
  */
-export function cleanupIdleSessions(sessions: Map<string, SessionData>, sessionTimeoutMs: number): void {
+export function cleanupIdleSessions(
+	sessions: Map<string, SessionData>,
+	sessionTimeoutMs: number,
+	bridge: McpBridge,
+): void {
 	const now = Date.now();
 	for (const [sessionId, session] of sessions) {
 		const idleTime = now - session.lastActivity;
 		if (idleTime > sessionTimeoutMs) {
+			bridge.disposeServer(session.server);
 			session.transport.close();
 			sessions.delete(sessionId);
-			log(`Session ${sessionId} timed out after ${Math.round(idleTime / 1000)}s of inactivity`);
+			log.info(`Session ${sessionId} timed out after ${Math.round(idleTime / 1000)}s of inactivity`);
 		}
 	}
 }
@@ -61,7 +67,7 @@ export function createHttpTransportApp(
 		const transport = new StreamableHTTPServerTransport({
 			sessionIdGenerator: () => sessionId,
 			onsessioninitialized: (id) => {
-				log(`Session initialized: ${id}`);
+				log.debug(`Session initialized: ${id}`);
 				sessions.set(id, sessionData);
 			},
 		});
@@ -69,7 +75,8 @@ export function createHttpTransportApp(
 		transport.onclose = () => {
 			const sid = transport.sessionId;
 			if (sid && sessions.has(sid)) {
-				log(`Transport closed for session ${sid}, removing from sessions map`);
+				log.debug(`Transport closed for session ${sid}, removing from sessions map`);
+				bridge.disposeServer(sessionData.server);
 				sessions.delete(sid);
 			}
 		};
@@ -116,7 +123,7 @@ export function createHttpTransportApp(
 	app.get("/health", (_req: Request, res: Response) => {
 		res.json({
 			status: "ok",
-			streamDeckConnected: bridge.isConnected,
+			AppConnected: bridge.isConnected,
 		});
 	});
 
@@ -133,7 +140,7 @@ export function createHttpTransportApp(
 				const newSessionId = crypto.randomUUID();
 				session = createSession(newSessionId);
 				await session.server.connect(session.transport as unknown as Transport);
-				log(`New session created: ${newSessionId}`);
+				log.debug(`New session created: ${newSessionId}`);
 			} else {
 				res.status(400).json({
 					jsonrpc: "2.0",
@@ -148,7 +155,7 @@ export function createHttpTransportApp(
 
 			await session.transport.handleRequest(req, res, req.body as unknown);
 		} catch (error) {
-			log("Error handling MCP POST request:", error);
+			log.error("Error handling MCP POST request:", error);
 			if (!res.headersSent) {
 				res.status(500).json({
 					jsonrpc: "2.0",
@@ -190,9 +197,10 @@ export function createHttpTransportApp(
 
 		const session = sessions.get(sessionId);
 		if (session) {
+			bridge.disposeServer(session.server);
 			session.transport.close();
 			sessions.delete(sessionId);
-			log(`Session deleted: ${sessionId}`);
+			log.debug(`Session deleted: ${sessionId}`);
 			res.status(204).send();
 		} else {
 			res.status(404).json({ error: "Session not found" });
@@ -223,11 +231,11 @@ export async function startHttpTransport(options: HttpTransportOptions = {}): Pr
 			const ngrokUrl = listener.url();
 			if (ngrokUrl) {
 				allowedOrigins.push(ngrokUrl);
-				log(`ngrok tunnel: ${ngrokUrl}`);
+				log.info(`ngrok tunnel: ${ngrokUrl}`);
 			}
 		} catch (error) {
-			log("Failed to start ngrok tunnel:", error);
-			log("Make sure NGROK_AUTHTOKEN is set");
+			log.error("Failed to start ngrok tunnel:", error);
+			log.error("Make sure NGROK_AUTHTOKEN is set");
 		}
 	}
 
@@ -238,7 +246,7 @@ export async function startHttpTransport(options: HttpTransportOptions = {}): Pr
 			try {
 				await session.server.sendToolListChanged();
 			} catch (error) {
-				log(`Failed to notify session ${sessionId}:`, error);
+				log.error(`Failed to notify session ${sessionId}:`, error);
 			}
 		}
 	});
@@ -248,12 +256,12 @@ export async function startHttpTransport(options: HttpTransportOptions = {}): Pr
 			try {
 				await session.server.sendResourceListChanged();
 			} catch (error) {
-				log(`Failed to notify session ${sessionId}:`, error);
+				log.error(`Failed to notify session ${sessionId}:`, error);
 			}
 		}
 	});
 
-	bridge.onStreamDeckNotification(async (method, params) => {
+	bridge.onClientNotification(async (method, params) => {
 		for (const [sessionId, session] of sessions) {
 			try {
 				await session.server.server.notification({
@@ -261,7 +269,7 @@ export async function startHttpTransport(options: HttpTransportOptions = {}): Pr
 					params: params as Record<string, unknown> | undefined,
 				});
 			} catch (error) {
-				log(`Failed to forward notification to session ${sessionId}:`, error);
+				log.error(`Failed to forward notification to session ${sessionId}:`, error);
 			}
 		}
 	});
@@ -272,7 +280,7 @@ export async function startHttpTransport(options: HttpTransportOptions = {}): Pr
 
 	await new Promise<void>((resolve, reject) => {
 		httpServer = app.listen(port, () => {
-			log(`HTTP server listening on port ${port}`);
+			log.info(`HTTP server listening on port ${port}`);
 			resolve();
 		});
 
@@ -293,13 +301,13 @@ export async function startHttpTransport(options: HttpTransportOptions = {}): Pr
 					message = `Failed to start HTTP server on port ${port}: ${error.message}`;
 			}
 
-			log(`HTTP server error: ${message}`);
+			log.error(`HTTP server error: ${message}`);
 			reject(new Error(message));
 		});
 	});
 
 	const cleanupIntervalId = setInterval(() => {
-		cleanupIdleSessions(sessions, sessionTimeoutMs);
+		cleanupIdleSessions(sessions, sessionTimeoutMs, bridge);
 	}, CLEANUP_INTERVAL_MS);
 
 	const cleanup = (): void => {
