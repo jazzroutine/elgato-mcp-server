@@ -44,16 +44,30 @@ export function unprefixName(prefixedName: string): { appName: string; itemName:
  * @returns Array of MCP Tool definitions.
  */
 export function convertToMcpTools(tools: McpTool[]): Tool[] {
-	return tools.map((tool) => ({
-		name: tool.name,
-		description: tool.description,
-		inputSchema: {
-			type: "object" as const,
-			...tool.inputSchema,
-		},
-		annotations: tool.annotations,
-		icons: tool.icons,
-	}));
+	return tools.map((tool) => {
+		const inputSchema = tool.inputSchema ?? {};
+		const properties = inputSchema.properties as { [x: string]: object } | undefined;
+		const required = inputSchema.required as string[] | undefined;
+
+		// Normalize empty or incomplete input schemas so clients that validate
+		// OpenAI-style tool schemas, such as AnythingLLM, always receive the
+		// required object schema fields (`properties` and `required`).
+		return {
+			name: tool.name,
+			description: tool.description,
+			inputSchema: {
+				...inputSchema,
+				type: "object" as const,
+				properties:
+					typeof properties === "object" && properties !== null && !Array.isArray(properties)
+						? properties
+						: {},
+				required: Array.isArray(required) ? required : [],
+			},
+			annotations: tool.annotations,
+			icons: tool.icons,
+		};
+	});
 }
 
 /**
